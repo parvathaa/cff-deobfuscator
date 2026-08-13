@@ -111,6 +111,21 @@ def extract_state_location(proj, dispatcher_addr: int):
                         "pattern extraction failed", switch_addr)
             return None, None
         root, table_base = result
+
+        # If the trace bottomed out at a bare register read, the switch
+        # block itself never computed that register's value -- check the
+        # other blocks in the same dispatcher chain (e.g. a bounds-check
+        # block) for where it was actually populated, since it's often a
+        # transient copy of the true, stack-resident state variable.
+        if isinstance(root, pyvex.IRExpr.Get):
+            other_chain_blocks = (search.chain_addrs or set()) - {switch_addr}
+            better_root, better_irsb, better_tmp_defs = _resolve_register_via_chain(
+                proj, root.offset, other_chain_blocks)
+            if better_root is not None:
+                log.info("Switch @ 0x%x: register read resolved further via "
+                         "another chain block (was a transient copy)", switch_addr)
+                root, irsb, tmp_defs = better_root, better_irsb, better_tmp_defs
+
         loc = _root_to_location(root, tmp_defs, irsb, proj.arch)
         if loc is None:
             return None, None
@@ -179,6 +194,46 @@ def _resolve(expr, tmp_defs):
     if isinstance(expr, pyvex.IRExpr.RdTmp):
         return tmp_defs.get(expr.tmp)
     return expr
+
+
+def _resolve_register_via_chain(proj, reg_offset, chain_block_addrs):
+    """
+    If the switch block reads a register whose value isn't computed
+    within the switch block itself, check whether one of the OTHER
+    blocks in the dispatcher chain (e.g. a bounds-check block) writes
+    to that same register.
+
+    Confirmed necessary against real output: the switch block can
+    simply re-read a register that an earlier chain block populated
+    from the true state variable's real location, a stack slot, via
+    something like `mov rax, [rbp-0x10]` in the bounds-check block,
+    immediately before the jump-table switch block runs. Without this,
+    the trace stops at the bare register read and incorrectly treats
+    a transient copy as the state variable's real location.
+
+    Returns (resolved_root_expr, its_block_irsb, its_tmp_defs) if found,
+    else (None, None, None). The irsb/tmp_defs are returned alongside
+    the root since it can come from a different block than the switch
+    block itself, and any RdTmp references within it must be resolved
+    against the tmp_defs of the block it actually appeared in.
+    """
+    for addr in chain_block_addrs:
+        irsb = proj.factory.block(addr).vex
+        tmp_defs = {s.tmp: s.data for s in irsb.statements if isinstance(s, pyvex.IRStmt.WrTmp)}
+        last_put_data = None
+        for stmt in irsb.statements:
+            if isinstance(stmt, pyvex.IRStmt.Put) and stmt.offset == reg_offset:
+                last_put_data = stmt.data
+        if last_put_data is None:
+            continue
+        # _trace_root already knows how to follow through Binop arithmetic
+        # (e.g. `rax = state - 3`) to find the real underlying Get/Load --
+        # confirmed necessary against real output where the register was
+        # set via an arithmetic adjustment, not a bare copy.
+        traced = _trace_root(last_put_data, tmp_defs)
+        if traced is not None:
+            return traced, irsb, tmp_defs
+    return None, None, None
 
 
 def _extract_jumptable_state(irsb, tmp_defs):
