@@ -1,0 +1,4 @@
+metric,O0,O2
+detection_recall_pct,93,30
+within_2_accuracy_pct,86,50
+pure_cff_targets,69,61
