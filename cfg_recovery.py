@@ -118,7 +118,7 @@ def _extract_compare_const(guard_expr, tmp_defs):
 
 
 def recover_function_cfg(proj, angr_function) -> RecoveryResult:
-    disp_info = disp_mod.detect_dispatcher(angr_function)
+    disp_info = disp_mod.detect_dispatcher(angr_function, proj=proj)
     if disp_info is None:
         log.info("Function @ 0x%x: no dispatcher detected, not flattened "
                   "(or detection missed it) -- returning original CFG untouched",

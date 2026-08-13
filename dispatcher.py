@@ -162,7 +162,24 @@ def build_transition_graph(angr_function) -> nx.DiGraph:
     return g
 
 
-def detect_dispatcher(angr_function) -> DispatcherInfo | None:
+def detect_dispatcher(angr_function, proj=None) -> DispatcherInfo | None:
+    """
+    proj is optional for backward compatibility, but strongly
+    recommended: without it, this falls back to the old back-edge-
+    funneling heuristic, which was found (by direct comparison against
+    real non-CFF functions in the same binary) to have substantial
+    overlap with genuinely flattened functions -- several non-CFF
+    functions scored HIGHER than the minimum seen among real CFF
+    functions, meaning no threshold on that metric alone can reliably
+    separate the two classes.
+
+    With proj supplied, candidates are instead confirmed by actually
+    attempting to resolve a real switch structure downstream
+    (resolve_switch_block) -- a jump table or a comparison chain with
+    at least 3 cases. This is a far more specific, structural signal
+    than graph statistics alone, and reuses the same extraction logic
+    already trusted elsewhere in the pipeline.
+    """
     g = build_transition_graph(angr_function)
     n = g.number_of_nodes()
     if n < MIN_BLOCKS_FOR_CFF:
@@ -187,10 +204,35 @@ def detect_dispatcher(angr_function) -> DispatcherInfo | None:
         log.debug("No in-degree outlier found -- likely not flattened")
         return None
 
-    # If multiple candidates, prefer the one with highest in-degree;
-    # Tigress occasionally produces a two-block dispatcher (a pre-check +
-    # the actual switch) which we treat as one unit in a later iteration.
     candidates.sort(key=lambda c: c[1], reverse=True)
+
+    if proj is not None:
+        for disp_addr, disp_indeg, _ in candidates:
+            search = resolve_switch_block(proj, disp_addr)
+            if search is None:
+                continue
+            irsb = proj.factory.block(search.switch_addr).vex
+            exit_count = sum(1 for s in irsb.statements if isinstance(s, pyvex.IRStmt.Exit))
+            is_jump_table = not isinstance(irsb.next, pyvex.IRExpr.Const)
+            if not (is_jump_table or exit_count >= 3):
+                continue  # too few cases to be confident this is genuine flattening
+
+            non_dispatcher_nodes = set(g.nodes) - {disp_addr}
+            funneling = sum(1 for node in non_dispatcher_nodes
+                             if set(g.successors(node)) == {disp_addr})
+            back_edge_fraction = funneling / len(non_dispatcher_nodes) if non_dispatcher_nodes else 0
+            real_blocks = {node for node in non_dispatcher_nodes
+                            if g.successors(node) and set(g.successors(node)) == {disp_addr}}
+
+            log.info("Dispatcher confirmed via switch resolution @ 0x%x "
+                      "(in-degree=%d, switch kind=%s)",
+                      disp_addr, disp_indeg, "jump_table" if is_jump_table else "exit_chain")
+            return DispatcherInfo(dispatcher_addr=disp_addr, real_blocks=real_blocks,
+                                   confidence=back_edge_fraction, in_degree=disp_indeg)
+        log.debug("No candidate had a resolvable switch structure -- likely not flattened")
+        return None
+
+    # Fallback path (no proj supplied): old back-edge-funneling heuristic.
     disp_addr, disp_indeg, _ = candidates[0]
 
     predecessors = set(g.predecessors(disp_addr))
@@ -198,9 +240,6 @@ def detect_dispatcher(angr_function) -> DispatcherInfo | None:
     if not non_dispatcher_nodes:
         return None
 
-    # confirm structural signature: most other blocks' *only* successor
-    # is the dispatcher (i.e. they're "real" blocks that finish by
-    # jumping back into the switch)
     funneling = 0
     for node in non_dispatcher_nodes:
         succs = set(g.successors(node))
