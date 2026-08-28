@@ -87,10 +87,16 @@ traceback, that's a bug; the log lines above are not.
 ## What v1 does
 
 1. **`dispatcher.py`** — detects the flattening dispatcher block via an
-   in-degree outlier + back-edge-funneling structural signature.
-   Obfuscator-agnostic (should work on both Tigress and OLLVM CFF, since
-   both produce the same shape), but only tested in design against
-   Tigress so far.
+   in-degree outlier, confirmed by actually resolving a real switch
+   structure (jump table or 3+-case comparison chain) downstream, rather
+   than by graph statistics alone. An earlier version relied on a
+   back-edge-funneling threshold instead; this was found, by direct
+   comparison against real non-CFF functions, to be unreliable (several
+   non-CFF functions scored higher on that metric than genuine CFF
+   functions did), and was replaced. Detection recall improved from 43%
+   to 93% as a result. Obfuscator-agnostic in principle (should work on
+   both Tigress and OLLVM CFF, since both produce the same shape), but
+   only validated against Tigress so far.
 
 2. **`state_analysis.py`** — extracts the dispatcher's state variable
    location (register or stack slot) directly from IR, then resolves
