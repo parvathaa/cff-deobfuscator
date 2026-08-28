@@ -64,6 +64,13 @@ class StateLocation:
     base_reg_offset: int | None = None
     stack_delta: int | None = None
     size_bytes: int = 4  # Tigress default state var is a 32-bit int
+    # Arithmetic offset between a value STORED at this location and the
+    # value the dispatcher actually uses as its jump-table/case index.
+    # Confirmed necessary: some functions read the register via an
+    # arithmetic transform of the true stack value (e.g. rax = state - 3),
+    # not a bare copy. Default 0 covers the common case (bare copy or
+    # direct stack access) with no behaviour change.
+    value_offset: int = 0
 
 
 @dataclass
@@ -117,18 +124,22 @@ def extract_state_location(proj, dispatcher_addr: int):
         # other blocks in the same dispatcher chain (e.g. a bounds-check
         # block) for where it was actually populated, since it's often a
         # transient copy of the true, stack-resident state variable.
+        value_offset = 0
         if isinstance(root, pyvex.IRExpr.Get):
             other_chain_blocks = (search.chain_addrs or set()) - {switch_addr}
-            better_root, better_irsb, better_tmp_defs = _resolve_register_via_chain(
+            better_root, better_irsb, better_tmp_defs, offset = _resolve_register_via_chain(
                 proj, root.offset, other_chain_blocks)
             if better_root is not None:
                 log.info("Switch @ 0x%x: register read resolved further via "
-                         "another chain block (was a transient copy)", switch_addr)
+                         "another chain block (was a transient copy, offset=%d)",
+                         switch_addr, offset)
                 root, irsb, tmp_defs = better_root, better_irsb, better_tmp_defs
+                value_offset = offset
 
         loc = _root_to_location(root, tmp_defs, irsb, proj.arch)
         if loc is None:
             return None, None
+        loc.value_offset = value_offset
         table_size = (search.bound_const + 1) if search.bound_const is not None else None
         switch_info = SwitchInfo(switch_addr=switch_addr, kind="jump_table",
                                   table_base=table_base, table_size=table_size,
@@ -196,6 +207,53 @@ def _resolve(expr, tmp_defs):
     return expr
 
 
+def _trace_root_with_offset(expr, tmp_defs):
+    """
+    Like _trace_root, but also accumulates any constant Add/Sub
+    encountered while descending through Binops, so the caller knows
+    the arithmetic relationship between the returned root and the
+    original expression.
+
+    Confirmed necessary against real output: for some functions the
+    dispatcher computes its jump-table index as `rax = stack_value - 3`,
+    not a bare copy of the stack-resident state variable. Finding the
+    stack location alone (via plain _trace_root) is not sufficient --
+    a literal value later written to that stack slot must have this
+    same offset applied before it corresponds to the index the
+    dispatcher will actually use.
+
+    Returns (root, offset) such that, for a literal value V written to
+    the root's location, the dispatcher-computed index is (V + offset).
+    Returns (None, None) if the arithmetic shape isn't a simple constant
+    Add/Sub chain this function knows how to track.
+    """
+    cur = expr
+    offset = 0
+    seen = set()
+    while True:
+        if isinstance(cur, pyvex.IRExpr.RdTmp):
+            if cur.tmp in seen or cur.tmp not in tmp_defs:
+                return None, None
+            seen.add(cur.tmp)
+            cur = tmp_defs[cur.tmp]
+            continue
+        if isinstance(cur, (pyvex.IRExpr.Get, pyvex.IRExpr.Load)):
+            return cur, offset
+        if isinstance(cur, pyvex.IRExpr.Binop):
+            a0, a1 = cur.args[0], cur.args[1]
+            const_val = a1.con.value if isinstance(a1, pyvex.IRExpr.Const) else None
+            if const_val is not None and "Sub" in cur.op:
+                offset -= const_val
+                cur = a0
+                continue
+            if const_val is not None and "Add" in cur.op:
+                offset += const_val
+                cur = a0
+                continue
+            return None, None
+        return None, None
+
+
 def _resolve_register_via_chain(proj, reg_offset, chain_block_addrs):
     """
     If the switch block reads a register whose value isn't computed
@@ -211,11 +269,14 @@ def _resolve_register_via_chain(proj, reg_offset, chain_block_addrs):
     the trace stops at the bare register read and incorrectly treats
     a transient copy as the state variable's real location.
 
-    Returns (resolved_root_expr, its_block_irsb, its_tmp_defs) if found,
-    else (None, None, None). The irsb/tmp_defs are returned alongside
-    the root since it can come from a different block than the switch
-    block itself, and any RdTmp references within it must be resolved
-    against the tmp_defs of the block it actually appeared in.
+    Returns (resolved_root_expr, its_block_irsb, its_tmp_defs, value_offset)
+    if found, else (None, None, None, 0). The irsb/tmp_defs are returned
+    alongside the root since it can come from a different block than the
+    switch block itself, and any RdTmp references within it must be
+    resolved against the tmp_defs of the block it actually appeared in.
+    value_offset is the arithmetic adjustment between a value stored at
+    the root's location and the value the dispatcher actually uses
+    (see _trace_root_with_offset).
     """
     for addr in chain_block_addrs:
         irsb = proj.factory.block(addr).vex
@@ -226,14 +287,10 @@ def _resolve_register_via_chain(proj, reg_offset, chain_block_addrs):
                 last_put_data = stmt.data
         if last_put_data is None:
             continue
-        # _trace_root already knows how to follow through Binop arithmetic
-        # (e.g. `rax = state - 3`) to find the real underlying Get/Load --
-        # confirmed necessary against real output where the register was
-        # set via an arithmetic adjustment, not a bare copy.
-        traced = _trace_root(last_put_data, tmp_defs)
+        traced, offset = _trace_root_with_offset(last_put_data, tmp_defs)
         if traced is not None:
-            return traced, irsb, tmp_defs
-    return None, None, None
+            return traced, irsb, tmp_defs, offset
+    return None, None, None, 0
 
 
 def _extract_jumptable_state(irsb, tmp_defs):
@@ -361,14 +418,19 @@ def analyze_block(proj, block_addr: int, loc: StateLocation) -> BlockStateResult
 
     const_val = _try_constant_fastpath(proj, block_addr, loc)
     if const_val is not None:
-        result.resolved_values = {const_val}
+        # Apply value_offset: a literal value STORED at loc's location is
+        # not necessarily the value the dispatcher actually indexes with,
+        # if this state variable is read via an arithmetic transform (see
+        # _trace_root_with_offset). Default value_offset=0 for the common
+        # case (bare copy) means this is a no-op everywhere else.
+        result.resolved_values = {const_val + loc.value_offset}
         result.method = "constant"
         return result
 
     log.debug("Block 0x%x: no constant found, falling back to symbolic exec", block_addr)
     values = _symbolic_fallback(proj, block_addr, loc)
     if values:
-        result.resolved_values = values
+        result.resolved_values = {v + loc.value_offset for v in values}
         result.method = "symbolic"
     return result
 
@@ -552,7 +614,12 @@ def resolve_case_chain_static(proj, entry_addr: int, chain_addrs: set, real_bloc
         succs = set(full_graph.successors(block_addr)) if block_addr in full_graph else set()
         if succs and succs.issubset(chain_addrs):
             if known_value is not None:
-                results.setdefault(block_addr, set()).add(known_value)
+                # Apply value_offset here too, for the same reason as in
+                # analyze_block: a literal value stored at loc's location
+                # is not necessarily what the dispatcher actually indexes
+                # with. Default value_offset=0 is a no-op for every
+                # function without this arithmetic-transform pattern.
+                results.setdefault(block_addr, set()).add(known_value + loc.value_offset)
             continue
 
         for succ in succs:
