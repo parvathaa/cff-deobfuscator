@@ -3,6 +3,87 @@
 Structural CFF-dispatcher recovery for stripped x64 ELF binaries, built
 against the [quarkslab diffing_obfuscation_dataset](https://github.com/quarkslab/diffing_obfuscation_dataset).
 
+## Quick Start
+
+### 1. Environment
+
+Requires Python 3.10-3.12. **Python 3.13+ is not yet reliably supported**
+by this project's dependencies (angr); if you're on a newer system Python,
+use a virtual environment pinned to 3.12.
+
+```bash
+python3.12 -m venv angr-env
+source angr-env/bin/activate
+pip install -r requirements.txt
+```
+
+`angr` is a large, slow install (several minutes, many transitive
+dependencies). This is expected.
+
+### 2. Getting the dataset
+
+This tool requires the Quarkslab `diffing_obfuscation_dataset` benchmark
+binaries. The dataset's CLI is **not on PyPI** and must be installed
+from source:
+
+```bash
+git clone https://github.com/quarkslab/diffing_obfuscation_dataset.git
+cd diffing_obfuscation_dataset
+pip install .
+cd ..
+```
+
+Then download the specific binaries you want to test against, for example:
+
+```bash
+mkdir -p dataset
+obfu-dataset-cli download-plain -r dataset/ -t 5 zlib
+obfu-dataset-cli download-obfuscated -r dataset/ -t 5 -p zlib -o tigress -op CFF -l 50
+```
+
+(Note: `download-plain` takes the project name as a plain argument;
+`download-obfuscated` requires it via `-p`. This asymmetry is in the
+upstream tool, not this project.)
+
+### 3. Running the pipeline
+
+**Run from the outer project directory** (the parent of the
+`cff_deobfuscator` package folder, *not* from inside it), otherwise
+Python cannot resolve the package import:
+
+```bash
+cd path/to/cff_deobfuscator   # NOT cff_deobfuscator/cff_deobfuscator
+python3 -m cff_deobfuscator.cli --help
+```
+
+If you've edited any source file and results seem stale or inconsistent,
+clear the bytecode cache before re-running:
+
+```bash
+find . -name "__pycache__" -exec rm -rf {} +
+```
+
+---
+
+## What Normal Output Looks Like
+
+**This tool logs extensively by design, and most warnings you'll see
+are expected, not errors.** In particular:
+
+- `unicornlib.dylib` failed to load — harmless; only affects an optional
+  acceleration backend not used by this pipeline.
+- `Switch block looked like a jump table but pattern extraction failed`
+  — expected for functions the detection heuristic flags as candidates
+  but correctly rejects (often ordinary code containing a real C
+  `switch` statement, not CFF). Detection is deliberately permissive;
+  extraction acts as the correctness gate.
+- `no switch-signature block found within N hops` — same as above, a
+  candidate was tried and correctly rejected.
+
+**A genuinely broken run** looks like a Python traceback / exception,
+not a `WARNING` or `ERROR`-prefixed log line. If you see a real
+traceback, that's a bug; the log lines above are not.
+
 ## What v1 does
 
 1. **`dispatcher.py`** — detects the flattening dispatcher block via an
