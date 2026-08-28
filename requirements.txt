@@ -1,0 +1,12 @@
+# Core analysis framework
+angr>=9.2
+
+# Graph construction and traversal
+networkx>=3.0
+
+# Note: claripy (constraint solving) is installed automatically as an
+# angr dependency, not listed separately here.
+
+# --- Dataset access (separate install, see README Quick Start) ---
+# The Quarkslab benchmark dataset CLI is NOT on PyPI and must be
+# installed from source. See README.md "Getting the dataset" below.
