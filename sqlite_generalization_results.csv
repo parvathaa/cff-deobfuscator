@@ -1,7 +1,7 @@
 metric,value
 pure_cff_targets,1199
-no_dispatcher_missed,278
-extraction_failed_excluded,120
+no_dispatcher_missed,279
+extraction_failed_excluded,119
 genuinely_compared,801
 exact_match,248
 within_2,689

@@ -241,15 +241,36 @@ See `o2_root_cause.md` for the full investigation. Checked on two
 functions directly, not the full `-O2` batch -- a systematic
 block-count comparison across all `-O2` targets is a natural next step.
 
-## Other known gaps
+## Resolved (as far as evidence allows): exit-chain (if/elif) dispatchers
 
-- **Exit-chain (if/elif) dispatchers less tested than jump-table ones.**
-  Both `build_case_map()` paths are implemented (`_build_case_map_exit_chain`
-  and `_build_case_map_jumptable`), but all real validation so far (the
-  batch results above) happened to be against jump-table dispatchers,
-  since that's what this Tigress/-O0/zlib combination produces. The
-  exit-chain path is implemented from the same IR patterns but hasn't
-  been exercised against a real exit-chain sample yet.
+Both `build_case_map()` paths are implemented
+(`_build_case_map_exit_chain` and `_build_case_map_jumptable`), but
+every real validation so far had happened to be against jump-table
+dispatchers. Searched exhaustively for a real exit-chain sample to
+validate against: the full zlib intensity sweep (10%-100%, jump-table
+in every one of ~700 detected dispatchers) and all 1,199 pure-CFF
+functions in sqlite. Three sqlite functions
+(`sqlite3PcacheInitialize`, `sqlite3_bind_text16`, `jsonPathSyntaxError`)
+initially appeared to be exit-chain dispatchers with 0 extractable
+cases each -- direct IR inspection showed this was a real, separate
+bug: `_is_switch_block`'s `exit_count >= 2` check counted *any* Exit
+statement, including `Ijk_SigSEGV` exits (VEX's semantic modeling of
+the CPU's alignment-fault behavior for aligned SSE stores, e.g.
+`movaps` in a variadic function's `va_start` register-save-area
+prologue -- `jsonPathSyntaxError` is a variadic error formatter). Fixed
+by requiring `jumpkind == "Ijk_Boring"` in both this check and
+`_build_case_map_exit_chain`'s own Exit-statement filter. After the
+fix, none of the three candidates classify as exit-chain any more (one
+now correctly resolves to a real jump-table dispatcher further down
+the chain; the others no longer detect at all). Re-scanning both
+codebases after the fix: **zero exit-chain dispatchers found anywhere**
+-- Tigress's `-O0` flatten pass appears to exclusively emit jump
+tables, at least across every sample in both tested codebases. The
+exit-chain code path remains implemented and untested against a real
+sample, but this is now an evidenced statement about what Tigress
+actually produces, not an unexamined assumption -- validating it
+would require either a different obfuscator/dataset, or hand-crafting
+a Tigress input specifically structured to force that code path.
 - **Stack-slot resolution assumes -O0 simplicity.** `_extract_stack_delta`
   expects `Add(Get(sp/bp), Const)` directly. `-O2` frame-pointer
   elimination or spill-slot reuse will break this — start all testing

@@ -61,7 +61,14 @@ def _build_case_map_exit_chain(proj, switch_info: sa.SwitchInfo) -> dict[int, in
 
     case_map = {}
     for stmt in irsb.statements:
-        if not isinstance(stmt, pyvex.IRStmt.Exit):
+        # Ijk_Boring only -- an Ijk_SigSEGV exit (VEX's alignment-fault
+        # modeling for an aligned SSE store, e.g. movaps in a variadic
+        # function's va_start prologue) is not a real case guard. These
+        # happen to use CmpNE rather than CmpEQ in practice, so
+        # _extract_compare_const already filters most of them out, but
+        # the jumpkind check is the actual semantic signal and is
+        # checked explicitly rather than relied on incidentally.
+        if not isinstance(stmt, pyvex.IRStmt.Exit) or stmt.jumpkind != "Ijk_Boring":
             continue
         const_val = _extract_compare_const(stmt.guard, tmp_defs)
         if const_val is not None:

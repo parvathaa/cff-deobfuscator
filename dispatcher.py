@@ -89,12 +89,26 @@ def _is_switch_block(irsb) -> bool:
     at level 50 -O0). A switch's terminating jump is always an ordinary
     control transfer (Ijk_Boring), never a return or a call, so that is
     excluded explicitly rather than relying on Const-ness alone.
+
+    Also confirmed necessary: the exit_count check must only count Exit
+    statements whose OWN jumpkind is Ijk_Boring. A block with 2+ aligned
+    SSE stores (`movaps`, common in a variadic function's va_start
+    register-save-area prologue) gets one Ijk_SigSEGV Exit per store --
+    VEX's semantic modeling of the CPU's real alignment-fault behavior
+    for aligned SIMD instructions, not a conditional branch in the
+    source at all. Counting these inflated exit_count past the >=2
+    threshold for functions with no real if/elif chain whatsoever (e.g.
+    sqlite's jsonPathSyntaxError: 8 Ijk_SigSEGV exits from 8 movaps
+    stores, plus exactly 1 genuine Ijk_Boring exit -- nowhere near a
+    real dispatcher, but exit_count() counted all 9 and misclassified
+    this prologue block as a switch with 0 extractable cases).
     """
     if irsb.jumpkind != "Ijk_Boring":
         return False
     if not isinstance(irsb.next, pyvex.IRExpr.Const):
         return True
-    exit_count = sum(1 for s in irsb.statements if isinstance(s, pyvex.IRStmt.Exit))
+    exit_count = sum(1 for s in irsb.statements
+                      if isinstance(s, pyvex.IRStmt.Exit) and s.jumpkind == "Ijk_Boring")
     return exit_count >= 2
 
 
@@ -244,7 +258,11 @@ def detect_dispatcher(angr_function, proj=None) -> DispatcherInfo | None:
             if search is None:
                 continue
             irsb = proj.factory.block(search.switch_addr).vex
-            exit_count = sum(1 for s in irsb.statements if isinstance(s, pyvex.IRStmt.Exit))
+            # Only Ijk_Boring exits are real conditional branches -- see
+            # _is_switch_block's docstring for why (Ijk_SigSEGV exits from
+            # aligned SSE stores inflate a naive count with no real cases).
+            exit_count = sum(1 for s in irsb.statements
+                              if isinstance(s, pyvex.IRStmt.Exit) and s.jumpkind == "Ijk_Boring")
             is_jump_table = not isinstance(irsb.next, pyvex.IRExpr.Const)
             if not (is_jump_table or exit_count >= 3):
                 continue  # too few cases to be confident this is genuine flattening
