@@ -94,7 +94,10 @@ traceback, that's a bug; the log lines above are not.
    comparison against real non-CFF functions, to be unreliable (several
    non-CFF functions scored higher on that metric than genuine CFF
    functions did), and was replaced. Detection recall improved from 43%
-   to 93% as a result. Obfuscator-agnostic in principle (should work on
+   to 86% as a result (an earlier measurement reported 93%, taken before
+   a separate bug in `resolve_switch_block` -- since fixed -- was found
+   to be inflating detection by misclassifying some return/call blocks
+   as switches). Obfuscator-agnostic in principle (should work on
    both Tigress and OLLVM CFF, since both produce the same shape), but
    only validated against Tigress so far.
 
@@ -113,87 +116,130 @@ traceback, that's a bug; the log lines above are not.
    (static, since the dispatcher itself isn't obfuscated) and stitches
    real-block → real-block edges together.
 
-4. **`evaluate.py`** — since the dataset ships the *plain* binary for
-   every obfuscated function, ground truth isn't hand-labeled: we
-   recover the plain function's CFG the normal way (no dispatcher games
-   needed) and diff against it. Reports node recall + edge
-   precision/recall/F1 under a topology-order node alignment.
+4. **Evaluation** — since the dataset ships the *plain* binary for every
+   obfuscated function, ground truth isn't hand-labeled: we recover the
+   plain function's CFG the normal way (no dispatcher games needed) and
+   compare against it. `batch_eval.py` (used by the `regenerate_*_csv.py`
+   scripts, and the source of every number in this README) compares
+   recovered cyclomatic complexity against ground truth -- found to be
+   the more robust metric, since exact node/edge alignment is unreliable
+   across separate compilations of the same source (see "Batch
+   validation results" below). `evaluate.py`/`cli.py` implement an
+   earlier, different metric (node recall + edge precision/recall/F1
+   under a topology-order alignment) that is **not** what any reported
+   number in this repo currently uses -- kept for reference, not wired
+   into the reproducible batch scripts.
 
 ## Batch validation results (zlib, Tigress CFF/50, -O0)
 
-Ran the full pipeline against all 69 pure-CFF functions in a single
-obfuscated zlib binary (`zlib_tigress_gcc_x64_CFF_50_1_O0.exe`),
-comparing recovered cyclomatic complexity (`edges - nodes + 2`) against
-each function's plain (unobfuscated) counterpart. Cyclomatic complexity
-is used here rather than exact node/edge matching because the plain and
-obfuscated binaries are separate compilations -- block splitting can
-differ even when the underlying logic is identical, so exact structural
-match was never the right bar. Complexity captures branching structure
-while being insensitive to how blocks happen to be split.
+Reproducible via `python3 -m cff_deobfuscator.regenerate_intensity_csv`
+(and the sibling `regenerate_o2_csv` / `regenerate_sqlite_csv` scripts)
+-- these regenerate `batch_results_by_intensity.csv`, `o2_results.csv`,
+and `sqlite_generalization_results.csv` from scratch via `batch_eval.py`,
+so the numbers below are never hand-adjusted. Comparison is by recovered
+cyclomatic complexity (`edges - nodes + 2`) against each function's plain
+(unobfuscated) counterpart, not exact node/edge matching -- the plain and
+obfuscated binaries are separate compilations, so block splitting can
+differ even when the underlying logic is identical; complexity captures
+branching structure while being insensitive to that.
 
-- **39/69** functions: no dispatcher detected (structural detection
-  heuristic missed them, or they were small enough that Tigress's
-  flattening didn't produce a clear in-degree outlier -- not yet
-  root-caused, a good next investigation)
-- **30/69** functions: dispatcher found, recovery attempted, ground
+Level 50, 69 pure-CFF functions:
+- **10/69** functions: no dispatcher detected
+- **1/69** functions: dispatcher found, but extraction correctly aborted
+  with an explicit error (state-variable location extraction failed)
+- **58/69** functions: dispatcher found, recovery attempted, ground
   truth available for comparison
-  - **1/30** exact cyclomatic-complexity match
-  - **22/30** within ±2 of ground truth
-  - Worst outliers: `init_block` (+13), `deflate`/`inflateBack` (+8),
-    `deflate_stored` (+6) -- see below, these all share one root cause
+  - **16/58** exact cyclomatic-complexity match
+  - **50/58** within ±2 of ground truth
+  - mean absolute diff: 1.48
 
-`send_tree` itself (the function used for initial validation, jump-table
+`send_tree` itself (the function used for initial development, jump-table
 dispatcher, 61 cases, `rbp`-relative state): recovered complexity 19 vs
 ground truth 20.
 
-## Known gap: register-based state variables in branching case chains
+Across the full obfuscation-intensity sweep (10%-100%), detection recall
+is **not** flat -- it rises with intensity, from 78.6% at 10% to 91.2% at
+100%, while within-2 accuracy stays roughly stable (73%-87%) throughout.
+On sqlite (1,199 pure-CFF functions, 17x zlib, zero code changes):
+77% detection recall, 86% within-2 accuracy, 31% exact match. On `-O2`
+(zlib level 50): detection recall collapses to 11% (see the dedicated
+gap below) -- root-caused, not just observed.
 
-**Root cause, confirmed via direct diagnostic (not guessed):** for
-functions where the dispatcher state variable lives in a **register**
-(e.g. `rax`) rather than on the stack, and the actual state assignment
-happens in an **earlier block within a case's branch chain** rather
-than in the terminal block that jumps back to the dispatcher, the
-pipeline currently produces wrong results.
+## Resolved: register-based state variables in branching case chains
 
-Concretely, for `init_block` (diff +13, the worst outlier): the state
-location is `StateLocation(kind='reg', reg_offset=16)` (rax). Direct
-inspection of all 13 terminal blocks in its case chains showed every
-one of them reading `rax` as still-symbolic/unconstrained at that
-point -- meaning none of them write to `rax` themselves. The real
-assignment happens in an earlier block in the same case's branch chain,
-which the current single-block-in-isolation analysis (`analyze_block`
-in `state_analysis.py`, called once per terminal block via a fresh
-`blank_state`) never sees, since `blank_state` starts fresh at each
-block address and has no memory of what happened earlier in the chain.
-This is very likely why the "hit solution cap (32)" warnings correlate
-almost exactly with the largest complexity-diff outliers in the batch
-results above: an unconstrained register produces arbitrary-looking
-wide solution sets that have nothing to do with the code's actual logic.
+**Was an open gap, now fixed.** For functions where the dispatcher state
+variable lives in a register (e.g. `rax`) rather than on the stack, and
+the actual state assignment happens in an earlier block within a case's
+branch chain rather than the terminal block that jumps back to the
+dispatcher, single-block-in-isolation analysis couldn't see the earlier
+assignment.
 
-**What was tried and explicitly reverted (documented for the record,
-not swept under the rug):** an attempt was made to fix this by
-symbolically executing each case's *entire* branch chain from its true
-entry point (via a new `resolve_case_chain` function) rather than each
-terminal block in isolation, tracking path history to attribute
-resolved values back to the correct terminal block. This was reverted
-after testing showed it made results dramatically worse (`send_tree`
-went from -1 off to -41 off) and every single case failed to resolve
-("never reached the dispatcher chain"). The bug was very likely in how
-active/deadended states were tracked across the `simgr.step()` loop
-(only `simgr.active` was checked for chain-arrival, dropping states
-that angr moves into `.deadended` -- the working single-block version
-correctly checked `active + deadended` together, and this distinction
-was lost in the rewrite), combined with `max_depth=8` allowing branch
-explosion with no pruning, which also explains the severe slowdown
-observed. The working commit (`00cf211`, current `HEAD` as of this
-writing) predates this attempt and remains the validated baseline.
+**What was tried and explicitly reverted (kept here for the record):**
+a first fix symbolically executed each case's *entire* branch chain from
+its true entry point, tracking path history to attribute resolved values
+back to the correct terminal block. This made results dramatically worse
+(`send_tree` went from -1 off to -41 off) due to a state-tracking defect
+(active/deadended simulation states weren't both checked across the
+`simgr.step()` loop) combined with unbounded branch exploration. It was
+reverted.
 
-**Next attempt should be narrower**, not a full path-exploration
-rewrite: e.g. extend `_try_constant_fastpath`'s static IR scan
-backward through a *linear* (non-branching) predecessor chain first,
-before reaching for full symbolic execution, and fix the
-active/deadended state-tracking bug explicitly if a symbolic
-whole-chain approach is attempted again.
+**What actually fixed it:** `resolve_case_chain_static` in
+`state_analysis.py` -- static (no execution) constant propagation forward
+across a case's branch chain at the IR level, carrying a known literal
+value across blocks rather than re-executing anything. This sidesteps
+the state-tracking bug class entirely, since nothing is symbolically
+stepped. See `cfg_recovery.recover_function_cfg` for how this is tried
+before falling back to the original per-block analysis.
+
+## Resolved: dispatcher detection false negatives (was "39/69 not detected")
+
+An earlier version of this README reported 39/69 functions with no
+dispatcher detected at all, "not yet root-caused." That number describes
+the *pre-redesign* baseline (back-edge-funneling heuristic, since
+replaced -- see `dispatcher.py`'s module docstring). Under the current
+switch-resolution-confirmed detection, the same batch misses only 10/69
+(see numbers above), and each of those 10 has been individually traced:
+either the state variable's initial in-degree candidate never resolves a
+switch structure at all (a genuine open miss, not yet root-caused per
+function), or -- confirmed for at least `gzopen64` -- the dispatcher
+*is* found correctly but the bounds-check block supplying the jump
+table's size sits on a control-flow path the BFS chain doesn't traverse,
+so the case map comes back empty. That specific failure mode (dispatcher
+found, case map empty) is a good next investigation, distinct from
+"not detected at all."
+
+## Resolved: `resolve_switch_block` misclassifying return/call blocks
+
+The BFS in `resolve_switch_block` used to chase any constant jump target
+without checking what kind of control transfer it was, so it could land
+on a `ret` instruction (whose target -- the return address -- is also a
+non-constant temp, which `_is_switch_block`'s old "non-constant next =
+jump table" check misread as an indirect jump table) or wander into an
+unrelated `call` target (once landing directly on `free@plt`). Fixed by
+requiring `jumpkind == "Ijk_Boring"` before ever classifying a block as
+a switch, and by only chasing a call edge when `proj.loader` confirms
+it isn't an external call (no PLT stub, no symbol) -- a blanket call-ban
+was tried first and broke a real case (`gzopen64`'s dispatcher sits
+behind what angr's CFG labels a call to an internal, unnamed helper).
+
+## `-O2`: root-caused, and worse than first reported
+
+Corrected detection recall at `-O2` (zlib level 50) is **11%**, not the
+30% originally reported -- most of that 30% was itself inflated by the
+return/call misclassification bug above. Direct IR inspection shows the
+in-degree candidate the heuristic finds at `-O2` is usually a
+compiler-generated **shared epilogue** (multiple function-exit paths
+converging on one register-restore-and-return sequence), which
+coincidentally produces the same high-in-degree signature as a real
+dispatcher. Block-count comparison against plain compilations confirms
+this isn't a detection failure on structure that's still there: at `-O0`
+obfuscated binaries have 2-3x more blocks than plain (flattening
+machinery untouched); at `-O2`, two directly-inspected functions showed
+ratios of 1.00 and 0.88 -- GCC's optimizer substantially or completely
+undoes Tigress's flattening as a side effect of ordinary optimization.
+See `o2_root_cause.md` for the full investigation. Checked on two
+functions directly, not the full `-O2` batch -- a systematic
+block-count comparison across all `-O2` targets is a natural next step.
 
 ## Other known gaps
 
@@ -213,14 +259,10 @@ whole-chain approach is attempted again.
 - **`MAX_SYMBOLIC_SOLUTIONS` cap (32)** is a blunt safety valve, not a
   principled bound — if you see functions hitting it, that's diagnostic
   signal the state variable was misidentified, not that the function is
-  legitimately that branchy (see the register-based-state gap above,
-  which is the confirmed cause in every case checked so far).
-- **39/69 pure-CFF functions in the batch test had no dispatcher
-  detected at all** — not yet root-caused. Worth checking whether these
-  are small functions where Tigress's flattening didn't produce a clear
-  in-degree statistical outlier (`INDEGREE_ZSCORE_THRESHOLD` in
-  `dispatcher.py` may need loosening), or a genuinely different
-  dispatcher shape not yet seen.
+  legitimately that branchy.
+- **Dispatcher found but case map empty** (confirmed for `gzopen64`,
+  see "Resolved: dispatcher detection false negatives" above) -- worth
+  checking whether other misses share this same cause.
 
 ## Roadmap toward the actual end goal (hybrid analysis)
 
@@ -228,13 +270,14 @@ The reason for building the symbolic fallback carefully now is that it's
 the piece the hybrid design leans on later. Rough shape of the next
 iterations:
 
-- **Iteration 2**: fix the register-based-state / branch-chain gap
-  documented above (properly this time — narrower approach, fix the
-  active/deadended tracking bug), root-cause the 39/69 no-dispatcher-
-  detected functions, extend validation to exit-chain dispatchers and
-  `-O2` binaries, and run batch validation across obfuscation levels
-  (10%/50%/100%) for a per-level accuracy curve — a natural chapter
-  figure.
+- **Iteration 2 (mostly done)**: the register-based-state / branch-chain
+  gap is fixed (see "Resolved" sections above), detection false
+  negatives dropped from 39/69 to 10/69 and the remaining ones are
+  partially root-caused, `-O2` has been investigated and its collapse
+  explained, and batch validation now runs across the full 10%-100%
+  intensity sweep (see `batch_results_by_intensity.csv`, reproducible
+  via `regenerate_intensity_csv.py`). Still open: exit-chain dispatcher
+  validation (see "Other known gaps").
 - **Iteration 3 (hybrid)**: pure static symbolic execution hits the
   classic **path explosion / code coverage ceiling** — deeply nested or
   loop-heavy real blocks won't get fully explored by Tier 2 alone within
@@ -252,12 +295,17 @@ iterations:
 
 ## Testing status
 
-Validated against real Tigress-flattened zlib binaries from the
-quarkslab dataset (see Batch validation results above) — this is no
-longer "not yet tested against real binaries." The core recovery
-pipeline (dispatcher detection, jump-table case-map reading,
-branch-aware real-block discovery, constant-propagation state
-resolution) works correctly on the common case. The remaining gap is
-specifically register-based state variables assigned earlier in a
-branch chain than the terminal block (documented above), plus the
-untested paths noted in "Other known gaps."
+Validated against real Tigress-flattened zlib and sqlite binaries from
+the quarkslab dataset, across the full obfuscation-intensity range and
+both `-O0` and `-O2` (see "Batch validation results" above). The core
+recovery pipeline (dispatcher detection, jump-table case-map reading,
+branch-aware real-block discovery, two-tier state resolution) works
+correctly on the common case and generalizes to a second, structurally
+unrelated, 17x-larger codebase with zero code changes. All reported
+numbers are reproducible from committed code via `batch_eval.py` and
+the `regenerate_*_csv.py` scripts, not hand-run or ad hoc. The remaining
+gaps are the exit-chain dispatcher path (implemented, never exercised
+against a real sample) and the specific per-function causes behind the
+small number of functions where a dispatcher is found but detection or
+case-map extraction still doesn't produce a usable result (see "Other
+known gaps").
