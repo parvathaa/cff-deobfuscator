@@ -1,10 +1,10 @@
 metric,value
 pure_cff_targets,1199
-no_dispatcher_missed,163
-extraction_failed_excluded,208
-genuinely_compared,828
-exact_match,252
-within_2,713
-detection_recall_pct,86
+no_dispatcher_missed,278
+extraction_failed_excluded,1
+genuinely_compared,920
+exact_match,275
+within_2,797
+detection_recall_pct,77
 exact_match_pct,30
-within_2_pct,86
+within_2_pct,87

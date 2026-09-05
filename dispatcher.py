@@ -51,6 +51,11 @@ log = logging.getLogger("cff.dispatcher")
 MIN_BLOCKS_FOR_CFF = 5          # tiny functions are never worth flagging
 INDEGREE_ZSCORE_THRESHOLD = 2.0  # candidate must be this many std-devs above mean
 MIN_BACK_EDGE_FRACTION = 0.5     # fraction of non-dispatcher blocks that funnel into it
+SWITCH_SEARCH_MAX_BLOCKS = 30    # BFS hop budget for resolve_switch_block; 8 was too
+                                 # shallow for some real -O0 functions (gf2_matrix_square,
+                                 # bi_reverse, zcfree all needed >8 hops to reach the true
+                                 # switch), confirmed safe to widen once the BFS was fixed
+                                 # to stop chasing call/return targets (see resolve_switch_block)
 
 
 @dataclass
@@ -75,14 +80,25 @@ def _is_switch_block(irsb) -> bool:
       - its terminating jump target is NOT a compile-time constant
         (an indirect jump -- the classic jump-table `jmp *table[state]`), or
       - it contains 2+ conditional Exit statements (an if/elif case chain).
+
+    Confirmed against real -O0 output that a non-constant `next` is not
+    sufficient on its own: a `ret` instruction's target (the return
+    address popped off the stack) is also a non-constant temp, and a
+    block ending Ijk_Ret was seen being misclassified as a jump-table
+    switch as a direct result (e.g. zlib's gf2_matrix_square, bi_reverse
+    at level 50 -O0). A switch's terminating jump is always an ordinary
+    control transfer (Ijk_Boring), never a return or a call, so that is
+    excluded explicitly rather than relying on Const-ness alone.
     """
+    if irsb.jumpkind != "Ijk_Boring":
+        return False
     if not isinstance(irsb.next, pyvex.IRExpr.Const):
         return True
     exit_count = sum(1 for s in irsb.statements if isinstance(s, pyvex.IRStmt.Exit))
     return exit_count >= 2
 
 
-def resolve_switch_block(proj, start_addr: int, max_blocks: int = 8) -> SwitchSearchResult | None:
+def resolve_switch_block(proj, start_addr: int, max_blocks: int = SWITCH_SEARCH_MAX_BLOCKS) -> SwitchSearchResult | None:
     """
     The block with the anomalous in-degree (found by detect_dispatcher)
     is where real blocks converge, but confirmed against actual Tigress
@@ -126,12 +142,28 @@ def resolve_switch_block(proj, start_addr: int, max_blocks: int = 8) -> SwitchSe
                                        chain_addrs=set(visited))
 
         for stmt in irsb.statements:
-            if isinstance(stmt, pyvex.IRStmt.Exit):
+            if isinstance(stmt, pyvex.IRStmt.Exit) and stmt.jumpkind == "Ijk_Boring":
                 queue.append(stmt.dst.value)
+        # Chase the block's own fallthrough/jump target when it's an
+        # ordinary control transfer (Ijk_Boring). A direct call's target
+        # also shows up here as a constant `next` (Ijk_Call), and whether
+        # to follow it is genuinely ambiguous: confirmed against real -O0
+        # output that chasing it can walk into an unrelated PLT stub (e.g.
+        # `free@plt` for zcfree, wrongly misidentified as a jump table),
+        # but for another function (gzopen64) the real switch logic sits
+        # behind exactly this kind of edge -- the compiler emitted it as
+        # what angr's CFG labels a call to an outlined internal helper,
+        # not a real external call. A PLT/import lookup distinguishes the
+        # two cases precisely: an external call target resolves to a
+        # named PLT stub or symbol, an internal one doesn't.
         if isinstance(irsb.next, pyvex.IRExpr.Const):
             nxt = irsb.next.con.value
-            if nxt != addr:  # don't chase a self-loop "invalid state" trap
-                queue.append(nxt)
+            is_external_call = (irsb.jumpkind == "Ijk_Call"
+                                 and (proj.loader.find_plt_stub_name(nxt) is not None
+                                      or proj.loader.find_symbol(nxt) is not None))
+            if irsb.jumpkind in ("Ijk_Boring", "Ijk_Call") and not is_external_call:
+                if nxt != addr:  # don't chase a self-loop "invalid state" trap
+                    queue.append(nxt)
 
     log.warning("resolve_switch_block: no switch-signature block found within "
                 "%d hops of 0x%x", max_blocks, start_addr)

@@ -53,14 +53,22 @@ class BinaryContext:
     def _load_ground_truth(self, path: str):
         with open(path) as f:
             entries = json.load(f)
+        # Confirmed against actual dataset output that ground-truth JSON
+        # comes in two shapes depending on the project: zlib's plain/
+        # obfuscated files and sqlite's obfuscated file are a list of
+        # {"address", "name", "obfu"} dicts, but sqlite's *plain* file is
+        # instead a flat {address_hex: name} map with no obfu info at all
+        # (plain binaries were never obfuscated, so there's nothing to
+        # record). Normalize both into the same iteration below.
+        if isinstance(entries, dict):
+            entries = [{"address": addr, "name": name, "obfu": []}
+                       for addr, name in entries.items()]
         for e in entries:
             addr = e["address"]
             addr = int(addr, 16) if isinstance(addr, str) else addr
-            # Real schema (confirmed against actual dataset output, differs
-            # from the README's simplified example): "obfu" is a list of
-            # applied obfuscation pass names, e.g. ["cff"], or an empty
-            # list for un-obfuscated functions in this file. A function
-            # counts as obfuscated if that list is non-empty.
+            # "obfu" is a list of applied obfuscation pass names, e.g.
+            # ["cff"], or an empty list for un-obfuscated functions in
+            # this file. A function counts as obfuscated if non-empty.
             obfu_passes = e.get("obfu", [])
             self.functions[e["name"]] = TargetFunction(
                 name=e["name"],
