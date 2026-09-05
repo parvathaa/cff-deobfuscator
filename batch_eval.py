@@ -109,7 +109,17 @@ def run_batch(obf_binary: str, obf_json: str, plain_binary: str, plain_json: str
             stats.per_function.append(FunctionResult(target.name, "no_dispatcher"))
             continue
 
-        if result.stats.get("error") is not None or result.recovered_cfg.number_of_nodes() == 0:
+        # recover_function_cfg always adds the function's own entry address
+        # as a node regardless of outcome, so recovered_cfg.number_of_nodes()
+        # is never 0 even when zero real blocks were resolved -- confirmed
+        # directly against gzopen64, whose case map came back empty (the
+        # bounds-check block supplying the jump table's size sits on a path
+        # this particular function's dispatcher chain doesn't traverse) yet
+        # still reported a 1-node, 0-edge "recovered" graph with no error
+        # set. real_block_count is the reliable signal for a genuinely
+        # empty/degenerate recovery.
+        if (result.stats.get("error") is not None
+                or not result.stats.get("real_block_count")):
             stats.extraction_failed += 1
             stats.per_function.append(FunctionResult(target.name, "extract_failed"))
             continue
