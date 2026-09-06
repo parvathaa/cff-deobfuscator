@@ -1,4 +1,6 @@
-import angr, json, logging, time
+import logging
+logging.disable(logging.CRITICAL)  # must run BEFORE importing angr to suppress the unicorn-load warning
+import angr, json, time
 
 logging.disable(logging.NOTSET)  # re-enable normal logging for THIS demo -- we want to see it
 logging.basicConfig(level=logging.INFO, format='%(levelname)-8s | %(message)s')
